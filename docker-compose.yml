@@ -1,0 +1,278 @@
+# Sentinella — local development orchestration
+#
+# Port allocation:
+#   8080  gateway        (AI traffic proxy, primary ingress)
+#   8081  policy         (OPA policy evaluation API)
+#   8082  ledger         (immutable audit trail API)
+#   8083  evals          (model evaluation engine API)
+#   8084  aibom          (AI bill of materials API)
+#   3000  console        (operator UI)
+#   8181  opa            (OPA decision engine, internal only)
+#   9092  kafka          (event streaming backbone)
+#   9000  minio          (S3-compatible object store for Iceberg)
+#   5432  postgres       (ledger metadata, console state)
+#   16686 jaeger         (distributed trace UI)
+#   3001  grafana        (metrics dashboards)
+#   9090  prometheus     (metrics scraping)
+
+services:
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sentinella
+      POSTGRES_PASSWORD: sentinella_dev
+      POSTGRES_DB: sentinella
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinella"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sentinella
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "sentinella-dev-cluster-01"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - sentinella
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: sentinella
+      MINIO_ROOT_PASSWORD: sentinella_dev
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sentinella
+
+  opa:
+    image: openpolicyagent/opa:0.63.0-rootless
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --log-format=json
+      - --set=decision_logs.console=true
+      - /policies
+    volumes:
+      - ./policies/rego:/policies:ro
+    ports:
+      - "8181:8181"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8181/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sentinella
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.56
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    networks:
+      - sentinella
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - sentinella
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: sentinella_dev
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - sentinella
+
+  # ── Application Services ─────────────────────────────────────────────────
+
+  gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      SENTINELLA_ENV: development
+      POLICY_SERVICE_URL: http://policy:8081
+      LEDGER_SERVICE_URL: http://ledger:8082
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: sentinella-gateway
+    depends_on:
+      policy:
+        condition: service_healthy
+      ledger:
+        condition: service_healthy
+    networks:
+      - sentinella
+
+  policy:
+    build:
+      context: ./services/policy
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      SENTINELLA_ENV: development
+      OPA_URL: http://opa:8181
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: sentinella-policy
+    depends_on:
+      opa:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sentinella
+
+  ledger:
+    build:
+      context: ./services/ledger
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      SENTINELLA_ENV: development
+      DATABASE_URL: postgresql://sentinella:sentinella_dev@postgres:5432/sentinella
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: sentinella
+      MINIO_SECRET_KEY: sentinella_dev
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: sentinella-ledger
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8082/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sentinella
+
+  evals:
+    build:
+      context: ./services/evals
+      dockerfile: Dockerfile
+    ports:
+      - "8083:8083"
+    environment:
+      SENTINELLA_ENV: development
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      LEDGER_SERVICE_URL: http://ledger:8082
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: sentinella-evals
+    depends_on:
+      ledger:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sentinella
+
+  aibom:
+    build:
+      context: ./services/aibom
+      dockerfile: Dockerfile
+    ports:
+      - "8084:8084"
+    environment:
+      SENTINELLA_ENV: development
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: sentinella
+      MINIO_SECRET_KEY: sentinella_dev
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: sentinella-aibom
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8084/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sentinella
+
+  console:
+    build:
+      context: ./services/console
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_GATEWAY_URL: http://localhost:8080
+      NEXT_PUBLIC_LEDGER_URL: http://localhost:8082
+      NEXT_PUBLIC_EVALS_URL: http://localhost:8083
+    depends_on:
+      - gateway
+    networks:
+      - sentinella
+
+networks:
+  sentinella:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  grafana_data:
