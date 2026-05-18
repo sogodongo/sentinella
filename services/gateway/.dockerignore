@@ -1,0 +1,4 @@
+*_test.go
+*.md
+.git
+bin/
